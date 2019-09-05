@@ -21,10 +21,12 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -47,12 +49,25 @@ func (*FakeController) LastSyncResourceVersion() string {
 
 func alwaysReady() bool { return true }
 
-func NewFromClient(kubeClient clientset.Interface, terminatedPodThreshold int) (*PodGCController, coreinformers.PodInformer) {
+func NewFromClient(kubeClient clientset.Interface, terminatedPodThreshold int) (*PodGCController, coreinformers.PodInformer, coreinformers.NodeInformer) {
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
 	podInformer := informerFactory.Core().V1().Pods()
-	controller := NewPodGC(kubeClient, podInformer, terminatedPodThreshold)
+	nodeInformer := informerFactory.Core().V1().Nodes()
+	controller := NewPodGC(kubeClient, podInformer, nodeInformer, terminatedPodThreshold)
 	controller.podListerSynced = alwaysReady
-	return controller, podInformer
+	return controller, podInformer, nodeInformer
+}
+
+func compareStringSetToList(set sets.String, list []string) bool {
+	for _, pod := range list {
+		if !set.Has(pod) {
+			return false
+		}
+	}
+	if len(list) != len(set) {
+		return false
+	}
+	return true
 }
 
 func TestGCTerminated(t *testing.T) {
@@ -113,7 +128,7 @@ func TestGCTerminated(t *testing.T) {
 
 	for i, test := range testCases {
 		client := fake.NewSimpleClientset(&v1.NodeList{Items: []v1.Node{*testutil.NewNode("node")}})
-		gcc, podInformer := NewFromClient(client, test.threshold)
+		gcc, podInformer, _ := NewFromClient(client, test.threshold)
 		deletedPodNames := make([]string, 0)
 		var lock sync.Mutex
 		gcc.deletePod = func(_, name string) error {
@@ -135,90 +150,203 @@ func TestGCTerminated(t *testing.T) {
 
 		gcc.gc()
 
-		pass := true
-		for _, pod := range deletedPodNames {
-			if !test.deletedPodNames.Has(pod) {
-				pass = false
-			}
-		}
-		if len(deletedPodNames) != len(test.deletedPodNames) {
-			pass = false
-		}
-		if !pass {
-			t.Errorf("[%v]pod's deleted expected and actual did not match.\n\texpected: %v\n\tactual: %v", i, test.deletedPodNames, deletedPodNames)
+		if pass := compareStringSetToList(test.deletedPodNames, deletedPodNames); !pass {
+			t.Errorf("[%v]pod's deleted expected and actual did not match.\n\texpected: %v\n\tactual: %v",
+				i, test.deletedPodNames.List(), deletedPodNames)
 		}
 	}
 }
 
 func TestGCOrphaned(t *testing.T) {
-	type nameToPhase struct {
-		name  string
-		phase v1.PodPhase
+	type podMeta struct {
+		name     string
+		nodeName string
+		phase    v1.PodPhase
+	}
+	type nodeEvent struct {
+		name string
+		kind watch.EventType
 	}
 
 	testCases := []struct {
-		pods            []nameToPhase
-		threshold       int
-		deletedPodNames sets.String
+		name               string
+		initialClientNodes []string
+		initialListerNodes []string
+		delay              time.Duration
+		nodeWatchEvents    []nodeEvent
+		clientChanges      []nodeEvent
+		pods               []podMeta
+		deletedPodNames    sets.String
 	}{
 		{
-			pods: []nameToPhase{
-				{name: "a", phase: v1.PodFailed},
-				{name: "b", phase: v1.PodSucceeded},
+			name:               "nodes present in lister",
+			initialListerNodes: []string{"existing1", "existing2"},
+			delay:              2 * quarantineTime,
+			pods: []podMeta{
+				{name: "a", nodeName: "existing1", phase: v1.PodRunning},
+				{name: "b", nodeName: "existing2", phase: v1.PodFailed},
+				{name: "c", nodeName: "existing2", phase: v1.PodSucceeded},
 			},
-			threshold:       0,
+			deletedPodNames: sets.NewString(),
+		},
+		{
+			name:               "nodes present in client",
+			initialClientNodes: []string{"existing1", "existing2"},
+			delay:              2 * quarantineTime,
+			pods: []podMeta{
+				{name: "a", nodeName: "existing1", phase: v1.PodRunning},
+				{name: "b", nodeName: "existing2", phase: v1.PodFailed},
+				{name: "c", nodeName: "existing2", phase: v1.PodSucceeded},
+			},
+			deletedPodNames: sets.NewString(),
+		},
+		{
+			name:  "no nodes",
+			delay: 2 * quarantineTime,
+			pods: []podMeta{
+				{name: "a", nodeName: "deleted", phase: v1.PodFailed},
+				{name: "b", nodeName: "deleted", phase: v1.PodSucceeded},
+			},
 			deletedPodNames: sets.NewString("a", "b"),
 		},
 		{
-			pods: []nameToPhase{
-				{name: "a", phase: v1.PodRunning},
+			name:  "quarantine not finished",
+			delay: quarantineTime / 2,
+			pods: []podMeta{
+				{name: "a", nodeName: "deleted", phase: v1.PodFailed},
 			},
-			threshold:       1,
+			deletedPodNames: sets.NewString(),
+		},
+		{
+			name:               "wrong nodes",
+			initialListerNodes: []string{"existing"},
+			delay:              2 * quarantineTime,
+			pods: []podMeta{
+				{name: "a", nodeName: "deleted", phase: v1.PodRunning},
+			},
 			deletedPodNames: sets.NewString("a"),
+		},
+		{
+			name:               "some nodes missing",
+			initialListerNodes: []string{"existing"},
+			delay:              2 * quarantineTime,
+			pods: []podMeta{
+				{name: "a", nodeName: "deleted", phase: v1.PodFailed},
+				{name: "b", nodeName: "existing", phase: v1.PodFailed},
+				{name: "c", nodeName: "deleted", phase: v1.PodSucceeded},
+				{name: "d", nodeName: "deleted", phase: v1.PodRunning},
+			},
+			deletedPodNames: sets.NewString("a", "c", "d"),
+		},
+		{
+			name:          "node added to client after quarantine",
+			delay:         2 * quarantineTime,
+			clientChanges: []nodeEvent{{"node", watch.Added}},
+			pods: []podMeta{
+				{name: "a", nodeName: "node", phase: v1.PodRunning},
+			},
+			deletedPodNames: sets.NewString(),
+		},
+		{
+			name:            "node add event after quarantine",
+			delay:           2 * quarantineTime,
+			nodeWatchEvents: []nodeEvent{{"node", watch.Added}},
+			pods: []podMeta{
+				{name: "a", nodeName: "node", phase: v1.PodFailed},
+			},
+			deletedPodNames: sets.NewString(),
+		},
+		{
+			name:               "node deleted from client after quarantine",
+			initialClientNodes: []string{"node"},
+			delay:              2 * quarantineTime,
+			clientChanges:      []nodeEvent{{"node", watch.Deleted}},
+			pods: []podMeta{
+				{name: "a", nodeName: "node", phase: v1.PodFailed},
+			},
+			deletedPodNames: sets.NewString("a"),
+		},
+		{
+			name:               "node delete event after quarantine",
+			delay:              2 * quarantineTime,
+			initialListerNodes: []string{"node"},
+			nodeWatchEvents:    []nodeEvent{{"node", watch.Deleted}},
+			pods: []podMeta{
+				{name: "a", nodeName: "node", phase: v1.PodSucceeded},
+			},
+			deletedPodNames: sets.NewString(),
 		},
 	}
 
-	for i, test := range testCases {
-		client := fake.NewSimpleClientset()
-		gcc, podInformer := NewFromClient(client, test.threshold)
-		deletedPodNames := make([]string, 0)
-		var lock sync.Mutex
-		gcc.deletePod = func(_, name string) error {
-			lock.Lock()
-			defer lock.Unlock()
-			deletedPodNames = append(deletedPodNames, name)
-			return nil
-		}
-
-		creationTime := time.Unix(0, 0)
-		for _, pod := range test.pods {
-			creationTime = creationTime.Add(1 * time.Hour)
-			podInformer.Informer().GetStore().Add(&v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Name: pod.name, CreationTimestamp: metav1.Time{Time: creationTime}},
-				Status:     v1.PodStatus{Phase: pod.phase},
-				Spec:       v1.PodSpec{NodeName: "node"},
-			})
-		}
-
-		pods, err := podInformer.Lister().List(labels.Everything())
-		if err != nil {
-			t.Errorf("Error while listing all Pods: %v", err)
-			return
-		}
-		gcc.gcOrphaned(pods)
-
-		pass := true
-		for _, pod := range deletedPodNames {
-			if !test.deletedPodNames.Has(pod) {
-				pass = false
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			nodeList := &v1.NodeList{}
+			for _, nodeName := range test.initialClientNodes {
+				nodeList.Items = append(nodeList.Items, *testutil.NewNode(nodeName))
 			}
-		}
-		if len(deletedPodNames) != len(test.deletedPodNames) {
-			pass = false
-		}
-		if !pass {
-			t.Errorf("[%v]pod's deleted expected and actual did not match.\n\texpected: %v\n\tactual: %v", i, test.deletedPodNames, deletedPodNames)
-		}
+			client := fake.NewSimpleClientset(nodeList)
+			gcc, podInformer, nodeInformer := NewFromClient(client, -1)
+			fakeClock := clock.NewFakeClock(time.Now())
+			gcc.nodeQueue = NewBasicUniqueWorkQueue(fakeClock)
+
+			deletedPodNames := make([]string, 0)
+			var lock sync.Mutex
+			gcc.deletePod = func(_, name string) error {
+				lock.Lock()
+				defer lock.Unlock()
+				deletedPodNames = append(deletedPodNames, name)
+				return nil
+			}
+
+			for _, nodeName := range test.initialListerNodes {
+				nodeInformer.Informer().GetStore().Add(testutil.NewNode(nodeName))
+			}
+			creationTime := time.Unix(0, 0)
+			for _, pod := range test.pods {
+				creationTime = creationTime.Add(1 * time.Hour)
+				podInformer.Informer().GetStore().Add(&v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: pod.name, CreationTimestamp: metav1.Time{Time: creationTime}},
+					Status:     v1.PodStatus{Phase: pod.phase},
+					Spec:       v1.PodSpec{NodeName: pod.nodeName},
+				})
+			}
+
+			// First GC of orphaned pods
+			gcc.gc()
+			if len(deletedPodNames) > 0 {
+				t.Errorf("no pods should be deleted at this point.\n\tactual: %v", deletedPodNames)
+			}
+			// Move clock forward
+			fakeClock.Step(test.delay)
+
+			// Execute planned nodes changes
+			for _, event := range test.nodeWatchEvents {
+				node := testutil.NewNode(event.name)
+				switch event.kind {
+				case watch.Added:
+					nodeInformer.Informer().GetStore().Add(node)
+				case watch.Deleted:
+					nodeInformer.Informer().GetStore().Delete(node)
+				}
+			}
+			for _, change := range test.clientChanges {
+				node := testutil.NewNode(change.name)
+				switch change.kind {
+				case watch.Added:
+					client.CoreV1().Nodes().Create(node)
+				case watch.Deleted:
+					client.CoreV1().Nodes().Delete(change.name, &metav1.DeleteOptions{})
+				}
+			}
+
+			// Actual pod deletion
+			gcc.gc()
+
+			if pass := compareStringSetToList(test.deletedPodNames, deletedPodNames); !pass {
+				t.Errorf("pod's deleted expected and actual did not match.\n\texpected: %v\n\tactual: %v",
+					test.deletedPodNames.List(), deletedPodNames)
+			}
+		})
 	}
 }
 
@@ -257,7 +385,7 @@ func TestGCUnscheduledTerminating(t *testing.T) {
 
 	for i, test := range testCases {
 		client := fake.NewSimpleClientset()
-		gcc, podInformer := NewFromClient(client, -1)
+		gcc, podInformer, _ := NewFromClient(client, -1)
 		deletedPodNames := make([]string, 0)
 		var lock sync.Mutex
 		gcc.deletePod = func(_, name string) error {
@@ -285,17 +413,9 @@ func TestGCUnscheduledTerminating(t *testing.T) {
 		}
 		gcc.gcUnscheduledTerminating(pods)
 
-		pass := true
-		for _, pod := range deletedPodNames {
-			if !test.deletedPodNames.Has(pod) {
-				pass = false
-			}
-		}
-		if len(deletedPodNames) != len(test.deletedPodNames) {
-			pass = false
-		}
-		if !pass {
-			t.Errorf("[%v]pod's deleted expected and actual did not match.\n\texpected: %v\n\tactual: %v, test: %v", i, test.deletedPodNames, deletedPodNames, test.name)
+		if pass := compareStringSetToList(test.deletedPodNames, deletedPodNames); !pass {
+			t.Errorf("[%v]pod's deleted expected and actual did not match.\n\texpected: %v\n\tactual: %v, test: %v",
+				i, test.deletedPodNames.List(), deletedPodNames, test.name)
 		}
 	}
 }
